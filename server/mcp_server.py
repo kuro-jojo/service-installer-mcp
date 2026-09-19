@@ -23,6 +23,7 @@ from server.service_manager import (
     read_healthcheck,
     read_published_ports,
     read_service_config,
+    read_service_volumes,
     service_urls,
     stop_service,
     uninstall_service,
@@ -32,7 +33,7 @@ from server.service_manager import (
 
 SERVICES_ROOT = os.environ.get(
     "SERVICE_INSTALLER_ROOT",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "services"),
+    "/home/jonathan/projects/ai/service-installer-mcp/services",
 )
 
 server = MCPServer(
@@ -112,7 +113,13 @@ def create_service(
             nginx). Defaults to `port`; set it when the image uses a fixed internal
             port.
         env_vars: Environment variables for the container.
-        volumes: Volume mounts, e.g. ["./data:/var/lib/data"].
+        volumes: Volume mounts, long or short syntax. Short syntax strings like
+            "./data:/var/lib/data" or "mydata:/var/lib/data", and dicts (long
+            syntax) like {"type": "bind", "source": "./data", "target":
+            "/var/lib/data"}. Relative bind-mount host paths resolve against the
+            service's own folder; host directories are created at install time.
+            Named volumes are declared in the compose file and removed with
+            remove_volumes on remove.
         healthcheck_path: HTTP path polled until it answers (HTTP web apps).
         healthcheck_tcp_port: TCP port polled until connectable; probed on the
             published host port. Use for non-HTTP services like redis/postgres.
@@ -193,6 +200,7 @@ def get_service_status(service_name: str) -> Dict[str, Any]:
         "running": is_running,
         "urls": service_urls(service_dir),
         "ports": read_published_ports(service_dir),
+        "volumes": read_service_volumes(service_dir),
         "containers": containers,
     }
     try:

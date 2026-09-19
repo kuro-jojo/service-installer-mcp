@@ -12,7 +12,7 @@ import socket
 import subprocess
 import time
 import urllib.request
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import yaml
 
@@ -156,6 +156,108 @@ def create_service_folder(location: str) -> str:
     return location
 
 
+def _split_short_volume(spec: str) -> Tuple[str, str, str]:
+    """Split short-syntax `[SOURCE:]TARGET[:MODE]` into (source, target, mode)."""
+    parts = spec.split(":")
+    if len(parts) == 1:
+        return "", parts[0], ""
+    if len(parts) == 2:
+        return parts[0], parts[1], ""
+    return parts[0], parts[1], ":".join(parts[2:])
+
+
+def parse_volume_spec(
+    volume: Union[str, Dict[str, Any]], base_dir: str
+) -> Dict[str, Any]:
+    """
+    Normalize one compose volume spec (short or long syntax) into canonical form.
+
+    Returns {"type": "bind"|"volume", "source": ..., "target": ...,
+    "read_only": bool}. Relative bind-mount host paths are resolved against
+    base_dir (the folder holding docker-compose.yaml) — matching docker compose
+    semantics — and the host directory is created so docker does not create it
+    as root (which would produce root-owned files that are hard to remove).
+    Named volumes (e.g. "mydata:/var/lib/data") stay as names and are declared
+    in the compose file's top-level volumes: section by the caller.
+    """
+    if isinstance(volume, dict):
+        vol_type = str(volume.get("type") or "").strip().lower()
+        source = str(volume.get("source") or "")
+        target = str(volume.get("target") or volume.get("dst") or "")
+        read_only = bool(volume.get("read_only", False))
+        create_host_path = bool(volume.get("create_host_path", True))
+    elif isinstance(volume, str):
+        source, target, mode = _split_short_volume(volume)
+        vol_type = ""
+        read_only = "ro" in mode.split(",")
+        create_host_path = True
+    else:
+        raise ServiceError(
+            f"Invalid volume spec {volume!r}: expected a string or dict"
+        )
+
+    if not target:
+        raise ServiceError(f"Volume spec {volume!r} has no target path")
+
+    if not vol_type:
+        if not source:
+            vol_type = "volume"  # anonymous volume
+        elif (
+            source.startswith((".", "~"))
+            or os.path.isabs(source)
+            or os.sep in source
+        ):
+            vol_type = "bind"
+        else:
+            vol_type = "volume"  # named volume
+
+    if vol_type not in ("bind", "volume"):
+        raise ServiceError(
+            f"Unsupported volume type {vol_type!r} in {volume!r}; "
+            "supported types are 'bind' and 'volume'"
+        )
+
+    spec: Dict[str, Any] = {
+        "type": vol_type,
+        "source": source,
+        "target": target,
+        "read_only": read_only,
+    }
+
+    if vol_type == "bind":
+        host_path = os.path.abspath(
+            os.path.join(base_dir, os.path.expanduser(source))
+        )
+        spec["source"] = host_path
+        if create_host_path:
+            try:
+                os.makedirs(host_path, exist_ok=True)
+            except OSError as exc:
+                raise ServiceError(
+                    f"Cannot create bind-mount host directory {host_path}: {exc}"
+                ) from exc
+    return spec
+
+
+def volume_compose_entry(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert a canonical volume spec into compose long-syntax form."""
+    entry: Dict[str, Any] = {"type": spec["type"], "target": spec["target"]}
+    if spec.get("source"):
+        entry["source"] = spec["source"]
+    if spec.get("read_only"):
+        entry["read_only"] = True
+    return entry
+
+
+def named_volume_sources(specs: List[Dict[str, Any]]) -> List[str]:
+    """Unique named-volume sources, in first-seen order."""
+    names: List[str] = []
+    for spec in specs:
+        if spec["type"] == "volume" and spec["source"] and spec["source"] not in names:
+            names.append(spec["source"])
+    return names
+
+
 def generate_compose_file(config: Dict[str, Any], location: str) -> str:
     """Write docker-compose.yaml into location. Returns the file path."""
     service_config: Dict[str, Any] = {
@@ -165,8 +267,16 @@ def generate_compose_file(config: Dict[str, Any], location: str) -> str:
         "restart": "always",
     }
 
-    if config["volumes"]:
-        service_config["volumes"] = config["volumes"]
+    compose_content: Dict[str, Any] = {
+        "services": {config["service_name"]: service_config}
+    }
+
+    if config.get("volumes"):
+        parsed = [parse_volume_spec(v, location) for v in config["volumes"]]
+        service_config["volumes"] = [volume_compose_entry(s) for s in parsed]
+        named = named_volume_sources(parsed)
+        if named:
+            compose_content["volumes"] = {name: {} for name in named}
 
     if config.get("healthcheck_path"):
         service_config["healthcheck"] = {
@@ -181,10 +291,6 @@ def generate_compose_file(config: Dict[str, Any], location: str) -> str:
             "retries": 3,
             "start_period": "10s",
         }
-
-    compose_content = {
-        "services": {config["service_name"]: service_config}
-    }
 
     filepath = os.path.join(location, "docker-compose.yaml")
     with open(filepath, "w") as f:
@@ -239,6 +345,18 @@ def read_published_ports(service_dir: str) -> List[Dict[str, int]]:
             except ValueError:
                 continue
     return ports
+
+
+def read_service_volumes(service_dir: str) -> List[Dict[str, Any]]:
+    """Read the volume mounts back from the service's compose file."""
+    config = read_service_config(service_dir)
+    mounts: List[Dict[str, Any]] = []
+    for entry in config.get("volumes") or []:
+        if isinstance(entry, dict):
+            mounts.append({k: v for k, v in entry.items() if v not in (None, "")})
+        else:
+            mounts.append({"mount": str(entry)})
+    return mounts
 
 
 def service_urls(service_dir: str) -> List[str]:
@@ -456,6 +574,7 @@ def describe_services(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for match in matches:
         info = dict(match)
         info["ports"] = read_published_ports(match["location"])
+        info["volumes"] = read_service_volumes(match["location"])
         try:
             is_running, containers, _logs = verify_service_status(match["location"])
             info["running"] = is_running
@@ -763,6 +882,11 @@ def install_service(
     time.sleep(startup_wait_seconds)
     is_running, containers, logs = verify_service_status(location)
 
+    installed_volumes = [
+        volume_compose_entry(v)
+        for v in (parse_volume_spec(x, location) for x in config["volumes"])
+    ]
+
     check = healthcheck_from_config(config)
     save_healthcheck(location, check)
     if check is None:
@@ -787,6 +911,7 @@ def install_service(
         "urls": [f"http://localhost:{config['port']}"],
         "location": location,
         "compose_file": compose_file,
+        "volumes": installed_volumes,
         "running": is_running,
         **readiness,
         "containers": containers,
